@@ -3,8 +3,10 @@ package proposer
 import (
 	"context"
 	"fmt"
+	"math/big"
 
 	"github.com/base/op-enclave/op-enclave/enclave"
+	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/predeploys"
@@ -12,11 +14,13 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/hashicorp/go-multierror"
 )
 
 type Prover struct {
+	rollupCfg   *rollup.Config
 	config      *enclave.PerChainConfig
 	chainConfig *params.ChainConfig
 	configHash  common.Hash
@@ -48,7 +52,9 @@ func NewProver(
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chain config: %w", err)
 	}
+	log.Info("succeed to new proposer", "chain_config", chainConfig, "rollup_config", rollupConfig)
 	return &Prover{
+		rollupCfg:   rollupConfig,
 		config:      cfg,
 		chainConfig: chainConfig,
 		configHash:  cfg.Hash(),
@@ -100,6 +106,20 @@ func (o *Prover) Generate(ctx context.Context, block *types.Block) (*Proposal, e
 		return fmt.Errorf("failed to fetch L1 receipts: %w", err)
 	})
 
+	l1TxsCh := await(func() (types.Transactions, error) {
+		return o.l1.BlockTransactions(ctx, blockRef.L1Origin.Hash)
+	}, func(err error) error {
+		return fmt.Errorf("failed to fetch L1 txs: %w", err)
+	})
+
+	// l1BaseFeeCh := await(func() (*big.Int, error) {
+	// 	return o.calculateL1BaseFee(ctx, blockRef, blockRef.L1Origin.Number)
+	// }, func(err error) error {
+	// 	return fmt.Errorf("failed to fetch L1 base fee: %w", err)
+	// })
+
+	// _ = l1BaseFeeCh
+
 	var errors []error
 
 	witness := <-witnessCh
@@ -116,6 +136,9 @@ func (o *Prover) Generate(ctx context.Context, block *types.Block) (*Proposal, e
 
 	l1Receipts := <-l1ReceiptsCh
 	errors = appendNonNil(errors, l1Receipts.err)
+
+	l1Txs := <-l1TxsCh
+	errors = appendNonNil(errors, l1Txs.err)
 
 	prevMessageAccount := <-prevMessageAccountCh
 	errors = appendNonNil(errors, prevMessageAccount.err)
@@ -146,6 +169,31 @@ func (o *Prover) Generate(ctx context.Context, block *types.Block) (*Proposal, e
 	if err != nil {
 		return nil, err
 	}
+	encodedL1Txs, err := marshalTxs(l1Txs.value, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var l1BaseFee *big.Int
+	{ // prepare l1 base fee for l1 info deposit tx of the l2 block
+		// l2 parent + l1 origin
+		previousBlock := types.NewBlockWithHeader(witness.value.Headers[0]).WithBody(types.Body{
+			Transactions: previousBlock.value.Transactions(),
+		})
+
+		l2Parent, err := derive.L2BlockToBlockRef(o.rollupCfg, previousBlock)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert parent L2 block to block ref: %w", err)
+		}
+		l1BaseFee, err = o.calculateL1BaseFee(ctx, l2Parent, eth.BlockID{
+			Hash:   l1Origin.value.Hash(),
+			Number: l1Origin.value.Number.Uint64(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate L1 base fee: %w", err)
+		}
+	}
+	_ = encodedL1Txs
 
 	output, err := o.enclave.ExecuteStateless(
 		ctx,
@@ -153,6 +201,7 @@ func (o *Prover) Generate(ctx context.Context, block *types.Block) (*Proposal, e
 		o.chainConfig,
 		l1Origin.value,
 		l1Receipts.value,
+		l1BaseFee, // l1 base fee for l1 info deposit tx of the l2 block
 		previousTxs,
 		block.Header(),
 		sequencedTxs,
